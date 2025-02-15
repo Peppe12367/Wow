@@ -15,6 +15,7 @@ from discord import app_commands
 TOKEN = ''  # TOKEN HERE
 SERVER_LIMIT = 1000000000000000000000000000000
 database_file = 'database.txt'
+BLACKLIST_FILE = 'blacklist.txt'
 
 # Set up logging for better debugging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
