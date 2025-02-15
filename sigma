@@ -13,8 +13,9 @@ import asyncio
 from discord import app_commands
 
 TOKEN = ''  # TOKEN HERE
-SERVER_LIMIT = 10000000000000000000000000000
+SERVER_LIMIT = 1
 database_file = 'database.txt'
+BLACKLIST_FILE = 'blacklist.txt'
 
 # Set up logging for better debugging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -26,6 +27,49 @@ intents.message_content = False
 bot = commands.Bot(command_prefix='/', intents=intents)
 client = docker.from_env()
 
+def is_blacklisted(user_id):
+    """Check if the user is blacklisted."""
+    if not os.path.exists(BLACKLIST_FILE):
+        return False
+    with open(BLACKLIST_FILE, 'r') as f:
+        blacklisted_users = f.readlines()
+    return user_id + '\n' in blacklisted_users
+
+def add_to_blacklist(user_id):
+    """Add a user to the blacklist."""
+    if not is_blacklisted(user_id):
+        with open(BLACKLIST_FILE, 'a') as f:
+            f.write(user_id + '\n')
+        logging.info(f"User {user_id} has been blacklisted.")
+
+def remove_from_blacklist(user_id):
+    """Remove a user from the blacklist."""
+    if is_blacklisted(user_id):
+        with open(BLACKLIST_FILE, 'r') as f:
+            blacklisted_users = f.readlines()
+        with open(BLACKLIST_FILE, 'w') as f:
+            for user in blacklisted_users:
+                if user != user_id + '\n':
+                    f.write(user)
+        logging.info(f"User {user_id} has been unblacklisted.")
+
+def is_admin(user_id):
+    """Check if the user is an admin."""
+    return user_id == "1256330773800157185"  # Admin User ID
+
+# Command check for blacklisted users (this will run before every command)
+def check_if_blacklisted(ctx):
+    """Prevent blacklisted users from using any commands."""
+    if is_blacklisted(str(ctx.author.id)):
+        raise commands.CheckFailure("You are blacklisted and cannot use any commands.")
+    return True
+
+# Apply the check to all commands
+@bot.check
+async def global_check(ctx):
+    return check_if_blacklisted(ctx)
+
+# Utility functions for database management (servers)
 def add_to_database(user, container_name, ssh_command):
     with open(database_file, 'a') as f:
         f.write(f"{user}|{container_name}|{ssh_command}\n")
@@ -70,6 +114,7 @@ def get_container_id_from_database(user):
         return servers[0].split('|')[1]
     return None
 
+# Bot event and status updating
 @bot.event
 async def on_ready():
     change_status.start()
@@ -88,6 +133,7 @@ async def change_status():
     except Exception as e:
         logging.error(f"Failed to update status: {e}")
 
+# Command functions
 async def capture_ssh_session_line(process):
     while True:
         output = await process.stdout.readline()
@@ -98,6 +144,7 @@ async def capture_ssh_session_line(process):
             return output.split("ssh session:")[1].strip()
     return None
 
+# SSH Command regen
 async def regen_ssh_command(interaction: discord.Interaction, container_name: str):
     user = str(interaction.user)
     container_id = get_container_id_from_database(user, container_name)
@@ -121,65 +168,34 @@ async def regen_ssh_command(interaction: discord.Interaction, container_name: st
     else:
         await interaction.response.send_message(embed=discord.Embed(description="Failed to generate new SSH session.", color=0xff0000))
 
-async def start_server(interaction: discord.Interaction, container_name: str):
-    user = str(interaction.user)
-    container_id = get_container_id_from_database(user, container_name)
-
-    if not container_id:
-        await interaction.response.send_message(embed=discord.Embed(description="No instance found for your user.", color=0xff0000))
+# Blacklist and Unblacklist commands (Admin only)
+@bot.command(name="blacklist")
+async def blacklist(ctx, user: discord.User):
+    """Blacklist a user if the requester is an admin."""
+    if not is_admin(str(ctx.author.id)):  # Check if the user is the admin
+        await ctx.send("You do not have permission to blacklist users.")
         return
 
-    try:
-        subprocess.run(["docker", "start", container_id], check=True)
-        exec_cmd = await asyncio.create_subprocess_exec("docker", "exec", container_id, "tmate", "-F",
-                                                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        ssh_session_line = await capture_ssh_session_line(exec_cmd)
-        if ssh_session_line:
-            await interaction.user.send(embed=discord.Embed(description=f"### Instance Started\nSSH Session Command: ```{ssh_session_line}```", color=0x00ff00))
-            await interaction.response.send_message(embed=discord.Embed(description="Instance started successfully. Check your DMs for details.", color=0x00ff00))
-        else:
-            await interaction.response.send_message(embed=discord.Embed(description="Instance started, but failed to get SSH session line.", color=0xff0000))
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Error starting instance: {e}")
-        await interaction.response.send_message(embed=discord.Embed(description=f"Error starting instance: {e}", color=0xff0000))
+    if is_blacklisted(str(user.id)):
+        await ctx.send(f"{user} is already blacklisted.")
+    else:
+        add_to_blacklist(str(user.id))
+        await ctx.send(f"{user} has been blacklisted.")
 
-async def stop_server(interaction: discord.Interaction, container_name: str):
-    user = str(interaction.user)
-    container_id = get_container_id_from_database(user, container_name)
-
-    if not container_id:
-        await interaction.response.send_message(embed=discord.Embed(description="No instance found for your user.", color=0xff0000))
+@bot.command(name="unblacklist")
+async def unblacklist(ctx, user: discord.User):
+    """Unblacklist a user if the requester is an admin."""
+    if not is_admin(str(ctx.author.id)):  # Check if the user is the admin
+        await ctx.send("You do not have permission to unblacklist users.")
         return
 
-    try:
-        subprocess.run(["docker", "stop", container_id], check=True)
-        await interaction.response.send_message(embed=discord.Embed(description="Instance stopped successfully.", color=0x00ff00))
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Error stopping instance: {e}")
-        await interaction.response.send_message(embed=discord.Embed(description=f"Error stopping instance: {e}", color=0xff0000))
+    if not is_blacklisted(str(user.id)):
+        await ctx.send(f"{user} is not blacklisted.")
+    else:
+        remove_from_blacklist(str(user.id))
+        await ctx.send(f"{user} has been unblacklisted.")
 
-async def restart_server(interaction: discord.Interaction, container_name: str):
-    user = str(interaction.user)
-    container_id = get_container_id_from_database(user, container_name)
-
-    if not container_id:
-        await interaction.response.send_message(embed=discord.Embed(description="No instance found for your user.", color=0xff0000))
-        return
-
-    try:
-        subprocess.run(["docker", "restart", container_id], check=True)
-        exec_cmd = await asyncio.create_subprocess_exec("docker", "exec", container_id, "tmate", "-F",
-                                                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        ssh_session_line = await capture_ssh_session_line(exec_cmd)
-        if ssh_session_line:
-            await interaction.user.send(embed=discord.Embed(description=f"### Instance Restarted\nSSH Session Command: ```{ssh_session_line}```\nOS: Ubuntu 22.04", color=0x00ff00))
-            await interaction.response.send_message(embed=discord.Embed(description="Instance restarted successfully. Check your DMs for details.", color=0x00ff00))
-        else:
-            await interaction.response.send_message(embed=discord.Embed(description="Instance restarted, but failed to get SSH session line.", color=0xff0000))
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Error restarting instance: {e}")
-        await interaction.response.send_message(embed=discord.Embed(description=f"Error restarting instance: {e}", color=0xff0000))
-
+# Command to deploy Ubuntu server (as an example)
 async def create_server_task(interaction):
     await interaction.response.send_message(embed=discord.Embed(description="## Creating VPS, This might take a few seconds.", color=0x00ff00))
     user = str(interaction.user)
@@ -190,9 +206,7 @@ async def create_server_task(interaction):
     image = "ubuntu-22.04-with-tmate"
     
     try:
-        container_id = subprocess.check_output([
-            "docker", "run", "-itd", image
-        ]).strip().decode('utf-8')
+        container_id = subprocess.check_output([ "docker", "run", "-itd", image ]).strip().decode('utf-8')
     except subprocess.CalledProcessError as e:
         logging.error(f"Error creating VPS: {str(e)}")
         await interaction.followup.send(embed=discord.Embed(description=f"Error creating VPS: {str(e)}", color=0xff0000))
@@ -222,7 +236,5 @@ async def create_server_task(interaction):
 @bot.tree.command(name="deploy", description="Creates a new Instance with Ubuntu 22.04")
 async def deploy_ubuntu(interaction: discord.Interaction):
     await create_server_task(interaction)
-
-# Other bot commands follow a similar structure.
 
 bot.run(TOKEN)
