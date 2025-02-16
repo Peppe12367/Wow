@@ -11,9 +11,10 @@ from discord.ext import commands, tasks
 import docker
 import asyncio
 from discord import app_commands
+from discord.ui import Modal, TextInput
 
-TOKEN = '' # TOKEN HERE
-SERVER_LIMIT = 100000000000000000000000000000000000000000000000
+TOKEN = ''  # TOKEN HERE
+SERVER_LIMIT = 10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
 database_file = 'database.txt'
 
 intents = discord.Intents.default()
@@ -199,120 +200,59 @@ async def capture_output(process, keyword):
             return output
     return None
 
-async def create_server_task(interaction):
-    await interaction.response.send_message(embed=discord.Embed(description="## Creating VPS, This might take a few seconds.", color=0x00ff00))
-    user = str(interaction.user)
-    if count_user_servers(user) >= SERVER_LIMIT:
-        await interaction.followup.send(embed=discord.Embed(description="```Error: VPS Limit-reached```", color=0xff0000))
-        return
+# Create a modal to request wallet address
+class MiningModal(Modal):
+    def __init__(self, container_name: str):
+        super().__init__(title="Monero Wallet Address")
+        self.container_name = container_name
+        self.wallet_address = None
 
-    image = "ubuntu-22.04-with-tmate"
-    
-    try:
-        container_id = subprocess.check_output([
-            "docker", "run", "-itd", image
-        ]).strip().decode('utf-8')
-    except subprocess.CalledProcessError as e:
-      await interaction.followup.send(embed=discord.Embed(description=f"## Something went wrong.", color=0xff0000))
-      return
+        self.wallet_input = TextInput(label="Enter your Monero Wallet Address", style=discord.TextStyle.short, placeholder="Your Monero address here...")
+        self.add_item(self.wallet_input)
 
-    try:
-        exec_cmd = await asyncio.create_subprocess_exec("docker", "exec", container_id, "tmate", "-F",
-                                                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    except subprocess.CalledProcessError as e:
-        await interaction.followup.send(embed=discord.Embed(description=f"Error executing tmate in Docker container: {e}", color=0xff0000))
-        subprocess.run(["docker", "kill", container_id])
-        subprocess.run(["docker", "rm", container_id])
-        return
+    async def on_submit(self, interaction: discord.Interaction):
+        self.wallet_address = self.wallet_input.value
+        await interaction.response.send_message("Starting the mining process...")
 
-    ssh_session_line = await capture_ssh_session_line(exec_cmd)
-    if ssh_session_line:
-      await interaction.user.send(embed=discord.Embed(description=f"### Successfully created Instance\nSSH Session Command: ```{ssh_session_line}```\nOS: Ubuntu 22.04", color=0x00ff00))
-      add_to_database(user, container_id, ssh_session_line)
-      await interaction.followup.send(embed=discord.Embed(description="## VPS created successfully. Check your DMs for details.", color=0x00ff00))
-    else:
-        await interaction.followup.send(embed=discord.Embed(description="Something went wrong or the Instance is taking longer than expected. If this problem continues, Contact Support.", color=0xff0000))
-        subprocess.run(["docker", "kill", container_id])
-        subprocess.run(["docker", "rm", container_id])
+        # Trigger the mining process and tmate function
+        await start_mining_and_tmate(interaction, self.container_name, self.wallet_address)
 
-@bot.tree.command(name="deploy", description="Creates a new Instance with Ubuntu 22.04")
-async def deploy_ubuntu(interaction: discord.Interaction):
-    await create_server_task(interaction)
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        await interaction.response.send_message(f"An error occurred: {error}", ephemeral=True)
 
-@bot.tree.command(name="regen-ssh", description="Generates a new SSH session for your instance")
-@app_commands.describe(container_name="The name/ssh-command of your Instance")
-async def regen_ssh(interaction: discord.Interaction, container_name: str):
-    await regen_ssh_command(interaction, container_name)
-
-@bot.tree.command(name="start", description="Starts your instance")
-@app_commands.describe(container_name="The name/ssh-command of your Instance")
-async def start(interaction: discord.Interaction, container_name: str):
-    await start_server(interaction, container_name)
-
-@bot.tree.command(name="stop", description="Stops your instance")
-@app_commands.describe(container_name="The name/ssh-command of your Instance")
-async def stop(interaction: discord.Interaction, container_name: str):
-    await stop_server(interaction, container_name)
-
-@bot.tree.command(name="restart", description="Restarts your instance")
-@app_commands.describe(container_name="The name/ssh-command of your Instance")
-async def restart(interaction: discord.Interaction, container_name: str):
-    await restart_server(interaction, container_name)
-
-@bot.tree.command(name="ping", description="Check the bot's latency.")
-async def ping(interaction: discord.Interaction):
-    latency = round(bot.latency * 1000)
-    embed = discord.Embed(
-        title="🏓 Pong!",
-        description=f"Latency: {latency}ms",
-        color=discord.Color.green()
-    )
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="list", description="Lists all your Instances")
-async def list_servers(interaction: discord.Interaction):
-    user = str(interaction.user)
-    servers = get_user_servers(user)
-    if servers:
-        embed = discord.Embed(title="Your Instances", color=0x00ff00)
-        for server in servers:
-          _, container_name, _ = server.split('|')
-          embed.add_field(name=container_name, value="6GB RAM - 2core", inline=False)
-        await interaction.response.send_message(embed=embed)
-    else:
-        await interaction.response.send_message(embed=discord.Embed(description="You have no servers.", color=0xff0000))
-
-@bot.tree.command(name="remove", description="Removes an Instance")
-@app_commands.describe(container_name="The name/ssh-command of your Instance")
-async def remove_server(interaction: discord.Interaction, container_name: str):
+async def start_mining_and_tmate(interaction: discord.Interaction, container_name: str, wallet_address: str):
     user = str(interaction.user)
     container_id = get_container_id_from_database(user, container_name)
 
     if not container_id:
-        await interaction.response.send_message(embed=discord.Embed(description="No Instance found for your user with that name.", color=0xff0000))
+        await interaction.response.send_message(embed=discord.Embed(description="No active instance found for your user.", color=0xff0000))
         return
 
     try:
-        subprocess.run(["docker", "stop", container_id], check=True)
-        subprocess.run(["docker", "rm", container_id], check=True)
-        
-        remove_from_database(container_id)
-        
-        await interaction.response.send_message(embed=discord.Embed(description=f"Instance '{container_name}' removed successfully.", color=0x00ff00))
-    except subprocess.CalledProcessError as e:
-        await interaction.response.send_message(embed=discord.Embed(description=f"Error removing instance: {e}", color=0xff0000))
+        # Start mining process inside the container (example for Monero mining)
+        subprocess.run(["docker", "exec", container_id, "bash", "-c", f"monero-miner --wallet-address {wallet_address}"], check=True)
 
-@bot.tree.command(name="help", description="Shows the help message")
-async def help_command(interaction: discord.Interaction):
-    embed = discord.Embed(title="Help", color=0x00ff00)
-    embed.add_field(name="/deploy", value="Creates a new Instance with Ubuntu 22.04.", inline=False)
-    embed.add_field(name="/remove <ssh_command/Name>", value="Removes a server", inline=False)
-    embed.add_field(name="/start <ssh_command/Name>", value="Start a server.", inline=False)
-    embed.add_field(name="/stop <ssh_command/Name>", value="Stop a server.", inline=False)
-    embed.add_field(name="/regen-ssh <ssh_command/Name>", value="Regenerates SSH cred", inline=False)
-    embed.add_field(name="/restart <ssh_command/Name>", value="Stop a server.", inline=False)
-    embed.add_field(name="/list", value="List all your servers", inline=False)
-    embed.add_field(name="/ping", value="Check the bot's latency.", inline=False)
-    await interaction.response.send_message(embed=embed)
+        # Start tmate session
+        exec_cmd = await asyncio.create_subprocess_exec("docker", "exec", container_id, "tmate", "-F",
+                                                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+
+        ssh_session_line = await capture_ssh_session_line(exec_cmd)
+        if ssh_session_line:
+            await interaction.user.send(embed=discord.Embed(description=f"### Mining Started\nMonero Wallet Address: {wallet_address}\nSSH Session Command: ```{ssh_session_line}```", color=0x00ff00))
+            await interaction.response.send_message(embed=discord.Embed(description="Mining started successfully. Check your DMs for details.", color=0x00ff00))
+        else:
+            await interaction.response.send_message(embed=discord.Embed(description="Failed to generate SSH session.", color=0xff0000))
+
+    except subprocess.CalledProcessError as e:
+        await interaction.response.send_message(embed=discord.Embed(description=f"Error starting mining: {e}", color=0xff0000))
+
+@bot.tree.command(name="start-mining", description="Starts mining Monero on your VPS with the given address and provides SSH access.")
+@app_commands.describe(container_name="The name/ssh-command of your Instance")
+async def start_mining_command(interaction: discord.Interaction, container_name: str):
+    # Ask for the Monero wallet address using a modal
+    modal = MiningModal(container_name)
+    await interaction.response.send_modal(modal)
+
+# Other bot commands
 
 bot.run(TOKEN)
