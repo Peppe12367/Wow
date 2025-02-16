@@ -1,16 +1,11 @@
-import random
 import logging
 import subprocess
-import sys
 import os
-import re
-import time
 import discord
-from discord.ext import commands, tasks
-import docker
-import asyncio
+from discord.ext import commands
 from discord import app_commands
 from discord.ui import Modal, TextInput
+import asyncio
 
 # Configuration Constants
 TOKEN = ''  # TOKEN HERE
@@ -22,7 +17,6 @@ intents.messages = False
 intents.message_content = False
 
 bot = commands.Bot(command_prefix='/', intents=intents)
-client = docker.from_env()
 
 # Logging Configuration
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
@@ -56,20 +50,25 @@ class MiningModal(Modal):
     def __init__(self, container_name: str):
         super().__init__(title="Monero Wallet Address")
         self.container_name = container_name
-        self.wallet_address = None
-
         self.wallet_input = TextInput(label="Enter your Monero Wallet Address", style=discord.TextStyle.short, placeholder="Your Monero address here...")
         self.add_item(self.wallet_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        self.wallet_address = self.wallet_input.value
+        wallet_address = self.wallet_input.value
         await interaction.response.send_message("Starting the mining process...")
 
         # Trigger the mining process and tmate function
-        await start_mining_and_tmate(interaction, self.container_name, self.wallet_address)
+        await start_mining_and_tmate(interaction, self.container_name, wallet_address)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         await interaction.response.send_message(f"An error occurred: {error}", ephemeral=True)
+
+async def capture_ssh_session_line(exec_cmd):
+    stdout, stderr = await exec_cmd.communicate()
+    if exec_cmd.returncode == 0:
+        # Assuming the SSH session line is in the stdout
+        return stdout.decode().strip()
+    return None
 
 async def start_mining_and_tmate(interaction: discord.Interaction, container_name: str, wallet_address: str):
     user = str(interaction.user)
@@ -81,7 +80,7 @@ async def start_mining_and_tmate(interaction: discord.Interaction, container_nam
 
     try:
         # Start mining process inside the container (example for Monero mining)
-        subprocess.run(["docker", "exec", container_id, "bash", "-c", f"monero-miner --wallet-address {wallet_address} --pool xmr.supported_pool_address"], check=True)
+        subprocess.run(["docker", "exec", container_id, "bash", "-c", f"xmrig -o xmr.supported_pool_address -u {wallet_address}"], check=True)
 
         # Start tmate session
         exec_cmd = await asyncio.create_subprocess_exec("docker", "exec", container_id, "tmate", "-F",
@@ -105,9 +104,10 @@ async def mining_command(interaction: discord.Interaction, container_name: str):
     modal = MiningModal(container_name)
     await interaction.response.send_modal(modal)
 
-# Ensure that the command tree is synced on startup
+# # Ensure that the command tree is synced on startup
 @bot.event
 async def on_ready():
     await bot.tree.sync()
+    logging.info(f"Logged in as {bot.user} and command tree synced.")
 
 bot.run(TOKEN)
