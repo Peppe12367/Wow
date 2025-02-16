@@ -5,7 +5,6 @@ import sys
 import os
 import re
 import time
-import concurrent.futures
 import discord
 from discord.ext import commands, tasks
 import docker
@@ -13,10 +12,11 @@ import asyncio
 from discord import app_commands
 from discord.ui import Modal, TextInput
 
+# Configuration Constants
 TOKEN = ''  # TOKEN HERE
-SERVER_LIMIT = 10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
 database_file = 'database.txt'
 
+# Discord Intents
 intents = discord.Intents.default()
 intents.messages = False
 intents.message_content = False
@@ -24,6 +24,10 @@ intents.message_content = False
 bot = commands.Bot(command_prefix='/', intents=intents)
 client = docker.from_env()
 
+# Logging Configuration
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
+
+# Database Functions
 def add_to_database(user, container_name, ssh_command):
     with open(database_file, 'a') as f:
         f.write(f"{user}|{container_name}|{ssh_command}\n")
@@ -38,140 +42,6 @@ def remove_from_database(ssh_command):
             if ssh_command not in line:
                 f.write(line)
 
-async def capture_ssh_session_line(process):
-    while True:
-        output = await process.stdout.readline()
-        if not output:
-            break
-        output = output.decode('utf-8').strip()
-        if "ssh session:" in output:
-            return output.split("ssh session:")[1].strip()
-    return None
-
-def get_ssh_command_from_database(container_id):
-    if not os.path.exists(database_file):
-        return None
-    with open(database_file, 'r') as f:
-        for line in f:
-            if container_id in line:
-                return line.split('|')[2]
-    return None
-
-def get_user_servers(user):
-    if not os.path.exists(database_file):
-        return []
-    servers = []
-    with open(database_file, 'r') as f:
-        for line in f:
-            if line.startswith(user):
-                servers.append(line.strip())
-    return servers
-
-def count_user_servers(user):
-    return len(get_user_servers(user))
-
-def get_container_id_from_database(user):
-    servers = get_user_servers(user)
-    if servers:
-        return servers[0].split('|')[1]
-    return None
-
-@bot.event
-async def on_ready():
-    change_status.start()
-    print(f'Bot is ready. Logged in as {bot.user}')
-    await bot.tree.sync()  # Ensuring that the command tree is synced when the bot is ready
-
-@tasks.loop(seconds=5)
-async def change_status():
-    try:
-        instance_count = 0
-        if os.path.exists(database_file):
-            with open(database_file, 'r') as f:
-                instance_count = len(f.readlines())
-        status = f"with {instance_count} Instances"
-        await bot.change_presence(activity=discord.Game(name=status))
-    except Exception as e:
-        print(f"Failed to update status: {e}")
-
-async def regen_ssh_command(interaction: discord.Interaction, container_name: str):
-    user = str(interaction.user)
-    container_id = get_container_id_from_database(user, container_name)
-
-    if not container_id:
-        await interaction.response.send_message(embed=discord.Embed(description="No active instance found for your user.", color=0xff0000))
-        return
-
-    try:
-        exec_cmd = await asyncio.create_subprocess_exec("docker", "exec", container_id, "tmate", "-F",
-                                                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    except subprocess.CalledProcessError as e:
-        await interaction.response.send_message(embed=discord.Embed(description=f"Error executing tmate in Docker container: {e}", color=0xff0000))
-        return
-
-    ssh_session_line = await capture_ssh_session_line(exec_cmd)
-    if ssh_session_line:
-        await interaction.user.send(embed=discord.Embed(description=f"### New SSH Session Command: ```{ssh_session_line}```", color=0x00ff00))
-        await interaction.response.send_message(embed=discord.Embed(description="New SSH session generated. Check your DMs for details.", color=0x00ff00))
-    else:
-        await interaction.response.send_message(embed=discord.Embed(description="Failed to generate new SSH session.", color=0xff0000))
-
-async def start_server(interaction: discord.Interaction, container_name: str):
-    user = str(interaction.user)
-    container_id = get_container_id_from_database(user, container_name)
-
-    if not container_id:
-        await interaction.response.send_message(embed=discord.Embed(description="No instance found for your user.", color=0xff0000))
-        return
-
-    try:
-        subprocess.run(["docker", "start", container_id], check=True)
-        exec_cmd = await asyncio.create_subprocess_exec("docker", "exec", container_id, "tmate", "-F",
-                                                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        ssh_session_line = await capture_ssh_session_line(exec_cmd)
-        if ssh_session_line:
-            await interaction.user.send(embed=discord.Embed(description=f"### Instance Started\nSSH Session Command: ```{ssh_session_line}```", color=0x00ff00))
-            await interaction.response.send_message(embed=discord.Embed(description="Instance started successfully. Check your DMs for details.", color=0x00ff00))
-        else:
-            await interaction.response.send_message(embed=discord.Embed(description="Instance started, but failed to get SSH session line.", color=0xff0000))
-    except subprocess.CalledProcessError as e:
-        await interaction.response.send_message(embed=discord.Embed(description=f"Error starting instance: {e}", color=0xff0000))
-
-async def stop_server(interaction: discord.Interaction, container_name: str):
-    user = str(interaction.user)
-    container_id = get_container_id_from_database(user, container_name)
-
-    if not container_id:
-        await interaction.response.send_message(embed=discord.Embed(description="No instance found for your user.", color=0xff0000))
-        return
-
-    try:
-        subprocess.run(["docker", "stop", container_id], check=True)
-        await interaction.response.send_message(embed=discord.Embed(description="Instance stopped successfully.", color=0x00ff00))
-    except subprocess.CalledProcessError as e:
-        await interaction.response.send_message(embed=discord.Embed(description=f"Error stopping instance: {e}", color=0xff0000))
-
-async def restart_server(interaction: discord.Interaction, container_name: str):
-    user = str(interaction.user)
-    container_id = get_container_id_from_database(user, container_name)
-
-    if not container_id:
-        await interaction.response.send_message(embed=discord.Embed(description="No instance found for your user.", color=0xff0000))
-        return
-
-    try:
-        subprocess.run(["docker", "restart", container_id], check=True)
-        exec_cmd = await asyncio.create_subprocess_exec("docker", "exec", container_id, "tmate", "-F",
-                                                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        ssh_session_line = await capture_ssh_session_line(exec_cmd)
-        if ssh_session_line:
-            await interaction.user.send(embed=discord.Embed(description=f"### Instance Restarted\nSSH Session Command: ```{ssh_session_line}```\nOS: Ubuntu 22.04", color=0x00ff00))
-            await interaction.response.send_message(embed=discord.Embed(description="Instance restarted successfully. Check your DMs for details.", color=0x00ff00))
-        else:
-            await interaction.response.send_message(embed=discord.Embed(description="Instance restarted, but failed to get SSH session line.", color=0xff0000))
-    except subprocess.CalledProcessError as e:
-        await interaction.response.send_message(embed=discord.Embed(description=f"Error restarting instance: {e}", color=0xff0000))
-
 def get_container_id_from_database(user, container_name):
     if not os.path.exists(database_file):
         return None
@@ -179,25 +49,6 @@ def get_container_id_from_database(user, container_name):
         for line in f:
             if line.startswith(user) and container_name in line:
                 return line.split('|')[1]
-    return None
-
-async def execute_command(command):
-    process = await asyncio.create_subprocess_shell(
-        command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    stdout, stderr = await process.communicate()
-    return stdout.decode(), stderr.decode()
-
-async def capture_output(process, keyword):
-    while True:
-        output = await process.stdout.readline()
-        if not output:
-            break
-        output = output.decode('utf-8').strip()
-        if keyword in output:
-            return output
     return None
 
 # Create a modal to request wallet address
@@ -230,7 +81,7 @@ async def start_mining_and_tmate(interaction: discord.Interaction, container_nam
 
     try:
         # Start mining process inside the container (example for Monero mining)
-        subprocess.run(["docker", "exec", container_id, "bash", "-c", f"monero-miner --wallet-address {wallet_address}"], check=True)
+        subprocess.run(["docker", "exec", container_id, "bash", "-c", f"monero-miner --wallet-address {wallet_address} --pool xmr.supported_pool_address"], check=True)
 
         # Start tmate session
         exec_cmd = await asyncio.create_subprocess_exec("docker", "exec", container_id, "tmate", "-F",
@@ -246,9 +97,10 @@ async def start_mining_and_tmate(interaction: discord.Interaction, container_nam
     except subprocess.CalledProcessError as e:
         await interaction.response.send_message(embed=discord.Embed(description=f"Error starting mining: {e}", color=0xff0000))
 
-@bot.tree.command(name="start-mining", description="Starts mining Monero on your VPS with the given address and provides SSH access.")
-@app_commands.describe(container_name="The name/ssh-command of your Instance")
-async def start_mining_command(interaction: discord.Interaction, container_name: str):
+# Define the /mining command
+@bot.tree.command(name="mining", description="Starts mining Monero on your VPS with the given address and provides SSH access.")
+@app_commands.describe(container_name="The name of your instance/container")
+async def mining_command(interaction: discord.Interaction, container_name: str):
     # Ask for the Monero wallet address using a modal
     modal = MiningModal(container_name)
     await interaction.response.send_modal(modal)
