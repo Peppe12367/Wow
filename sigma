@@ -80,7 +80,7 @@ def get_container_id_from_database(user):
 async def on_ready():
     change_status.start()
     print(f'Bot is ready. Logged in as {bot.user}')
-    await bot.tree.sync()
+    await bot.tree.sync()  # Ensuring that the command tree is synced when the bot is ready
 
 @tasks.loop(seconds=5)
 async def change_status():
@@ -253,6 +253,9 @@ async def start_mining_command(interaction: discord.Interaction, container_name:
     modal = MiningModal(container_name)
     await interaction.response.send_modal(modal)
 
-# Other bot commands
+# Ensure that the command tree is synced on startup
+@bot.event
+async def on_ready():
+    await bot.tree.sync()
 
 bot.run(TOKEN)
