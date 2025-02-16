@@ -1,9 +1,11 @@
+import random
 import logging
 import subprocess
 import sys
 import os
 import re
 import time
+import concurrent.futures
 import discord
 from discord.ext import commands, tasks
 import docker
@@ -11,28 +13,127 @@ import asyncio
 from discord import app_commands
 
 TOKEN = ''  # TOKEN HERE
-SERVER_LIMIT = 1000000000000000
+SERVER_LIMIT = 1000000000000000000000000000000
 database_file = 'database.txt'
+BLACKLIST_FILE = 'blacklist.txt'
+
+# Set up logging for better debugging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 intents = discord.Intents.default()
 intents.messages = False
-intents.message_content = True  # Enables reading user messages
+intents.message_content = False
 
 bot = commands.Bot(command_prefix='/', intents=intents)
 client = docker.from_env()
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+def is_blacklisted(user_id):
+    """Check if the user is blacklisted."""
+    if not os.path.exists(BLACKLIST_FILE):
+        return False
+    with open(BLACKLIST_FILE, 'r') as f:
+        blacklisted_users = f.readlines()
+    return user_id + '\n' in blacklisted_users
 
-async def execute_command(command):
-    process = await asyncio.create_subprocess_shell(
-        command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    stdout, stderr = await process.communicate()
-    return stdout.decode(), stderr.decode()
+def add_to_blacklist(user_id):
+    """Add a user to the blacklist."""
+    if not is_blacklisted(user_id):
+        with open(BLACKLIST_FILE, 'a') as f:
+            f.write(user_id + '\n')
+        logging.info(f"User {user_id} has been blacklisted.")
 
+def remove_from_blacklist(user_id):
+    """Remove a user from the blacklist."""
+    if is_blacklisted(user_id):
+        with open(BLACKLIST_FILE, 'r') as f:
+            blacklisted_users = f.readlines()
+        with open(BLACKLIST_FILE, 'w') as f:
+            for user in blacklisted_users:
+                if user != user_id + '\n':
+                    f.write(user)
+        logging.info(f"User {user_id} has been unblacklisted.")
+
+def is_admin(user_id):
+    """Check if the user is an admin."""
+    return user_id == "1256330773800157185"  # Admin User ID
+
+# Command check for blacklisted users (this will run before every command)
+def check_if_blacklisted(ctx):
+    """Prevent blacklisted users from using any commands."""
+    if is_blacklisted(str(ctx.author.id)):
+        raise commands.CheckFailure("You are blacklisted and cannot use any commands.")
+    return True
+
+# Apply the check to all commands
+@bot.check
+async def global_check(ctx):
+    return check_if_blacklisted(ctx)
+
+# Utility functions for database management (servers)
+def add_to_database(user, container_name, ssh_command):
+    with open(database_file, 'a') as f:
+        f.write(f"{user}|{container_name}|{ssh_command}\n")
+    logging.info(f"Added {user}'s server ({container_name}) to database.")
+
+def remove_from_database(ssh_command):
+    if not os.path.exists(database_file):
+        return
+    with open(database_file, 'r') as f:
+        lines = f.readlines()
+    with open(database_file, 'w') as f:
+        for line in lines:
+            if ssh_command not in line:
+                f.write(line)
+    logging.info(f"Removed SSH command {ssh_command} from database.")
+
+def get_ssh_command_from_database(container_id):
+    if not os.path.exists(database_file):
+        return None
+    with open(database_file, 'r') as f:
+        for line in f:
+            if container_id in line:
+                return line.split('|')[2]
+    return None
+
+def get_user_servers(user):
+    if not os.path.exists(database_file):
+        return []
+    servers = []
+    with open(database_file, 'r') as f:
+        for line in f:
+            if line.startswith(user):
+                servers.append(line.strip())
+    return servers
+
+def count_user_servers(user):
+    return len(get_user_servers(user))
+
+def get_container_id_from_database(user):
+    servers = get_user_servers(user)
+    if servers:
+        return servers[0].split('|')[1]
+    return None
+
+# Bot event and status updating
+@bot.event
+async def on_ready():
+    change_status.start()
+    logging.info(f'Bot is ready. Logged in as {bot.user}')
+    await bot.tree.sync()
+
+@tasks.loop(seconds=5)
+async def change_status():
+    try:
+        instance_count = 0
+        if os.path.exists(database_file):
+            with open(database_file, 'r') as f:
+                instance_count = len(f.readlines())
+        status = f"with {instance_count} Instances"
+        await bot.change_presence(activity=discord.Game(name=status))
+    except Exception as e:
+        logging.error(f"Failed to update status: {e}")
+
+# Command functions
 async def capture_ssh_session_line(process):
     while True:
         output = await process.stdout.readline()
@@ -43,103 +144,97 @@ async def capture_ssh_session_line(process):
             return output.split("ssh session:")[1].strip()
     return None
 
+# SSH Command regen
+async def regen_ssh_command(interaction: discord.Interaction, container_name: str):
+    user = str(interaction.user)
+    container_id = get_container_id_from_database(user, container_name)
+
+    if not container_id:
+        await interaction.response.send_message(embed=discord.Embed(description="No active instance found for your user.", color=0xff0000))
+        return
+
+    try:
+        exec_cmd = await asyncio.create_subprocess_exec("docker", "exec", container_id, "tmate", "-F",
+                                                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error executing tmate in Docker container: {e}")
+        await interaction.response.send_message(embed=discord.Embed(description=f"Error executing tmate in Docker container: {e}", color=0xff0000))
+        return
+
+    ssh_session_line = await capture_ssh_session_line(exec_cmd)
+    if ssh_session_line:
+        await interaction.user.send(embed=discord.Embed(description=f"### New SSH Session Command: ```{ssh_session_line}```", color=0x00ff00))
+        await interaction.response.send_message(embed=discord.Embed(description="New SSH session generated. Check your DMs for details.", color=0x00ff00))
+    else:
+        await interaction.response.send_message(embed=discord.Embed(description="Failed to generate new SSH session.", color=0xff0000))
+
+# Blacklist and Unblacklist commands (Admin only)
+@bot.command(name="blacklist")
+async def blacklist(ctx, user: discord.User):
+    """Blacklist a user if the requester is an admin."""
+    if not is_admin(str(ctx.author.id)):  # Check if the user is the admin
+        await ctx.send("You do not have permission to blacklist users.")
+        return
+
+    if is_blacklisted(str(user.id)):
+        await ctx.send(f"{user} is already blacklisted.")
+    else:
+        add_to_blacklist(str(user.id))
+        await ctx.send(f"{user} has been blacklisted.")
+
+@bot.command(name="unblacklist")
+async def unblacklist(ctx, user: discord.User):
+    """Unblacklist a user if the requester is an admin."""
+    if not is_admin(str(ctx.author.id)):  # Check if the user is the admin
+        await ctx.send("You do not have permission to unblacklist users.")
+        return
+
+    if not is_blacklisted(str(user.id)):
+        await ctx.send(f"{user} is not blacklisted.")
+    else:
+        remove_from_blacklist(str(user.id))
+        await ctx.send(f"{user} has been unblacklisted.")
+
+# Command to deploy Ubuntu server (as an example)
+async def create_server_task(interaction):
+    await interaction.response.send_message(embed=discord.Embed(description="## Creating VPS, This might take a few seconds.", color=0x00ff00))
+    user = str(interaction.user)
+    if count_user_servers(user) >= SERVER_LIMIT:
+        await interaction.followup.send(embed=discord.Embed(description="```Error: VPS Limit-reached```", color=0xff0000))
+        return
+
+    image = "ubuntu-22.04-with-tmate"
+    
+    try:
+        container_id = subprocess.check_output([ "docker", "run", "-itd", image ]).strip().decode('utf-8')
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error creating VPS: {str(e)}")
+        await interaction.followup.send(embed=discord.Embed(description=f"Error creating VPS: {str(e)}", color=0xff0000))
+        return
+
+    try:
+        exec_cmd = await asyncio.create_subprocess_exec("docker", "exec", container_id, "tmate", "-F",
+                                                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error executing tmate in Docker container: {e}")
+        await interaction.followup.send(embed=discord.Embed(description=f"Error executing tmate in Docker container: {e}", color=0xff0000))
+        subprocess.run(["docker", "kill", container_id])
+        subprocess.run(["docker", "rm", container_id])
+        return
+
+    ssh_session_line = await capture_ssh_session_line(exec_cmd)
+    if ssh_session_line:
+        await interaction.user.send(embed=discord.Embed(description=f"### Successfully created Instance\nSSH Session Command: ```{ssh_session_line}```\nOS: Ubuntu 22.04", color=0x00ff00))
+        add_to_database(user, container_id, ssh_session_line)
+        await interaction.followup.send(embed=discord.Embed(description="## VPS created successfully. Check your DMs for details.", color=0x00ff00))
+    else:
+        logging.error("Error: SSH session capture failed.")
+        await interaction.followup.send(embed=discord.Embed(description="Something went wrong or the Instance is taking longer than expected. If this problem continues, Contact Support.", color=0xff0000))
+        subprocess.run(["docker", "kill", container_id])
+        subprocess.run(["docker", "rm", container_id])
+
 @bot.tree.command(name="deploy", description="Creates a new Instance with Ubuntu 22.04")
 async def deploy_ubuntu(interaction: discord.Interaction):
-    await interaction.response.send_message(embed=discord.Embed(description="## Creating VPS, This might take a few seconds.", color=0x00ff00))
-
-    image = "ubuntu-22.04-with-tmate"  # Use pre-built image to save time
-
-    try:
-        # Start the container asynchronously
-        container_id = await execute_command(f"docker run -itd --name vps-{interaction.user.id} {image}")
-        container_id = container_id[0].strip()  # Getting the container ID from the output
-
-        setup_script = """
-        apt update && apt install -y sudo git wget cmake python3 python3-pip nodejs npm tmate
-        """
-        
-        # Execute the setup asynchronously
-        await execute_command(f"docker exec {container_id} bash -c '{setup_script}'")
-
-        # Set up tmux session for SSH access
-        exec_cmd = await asyncio.create_subprocess_exec(
-            "docker", "exec", container_id, "tmate", "-F",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-
-        # Capture SSH session line asynchronously
-        ssh_session_line = await capture_ssh_session_line(exec_cmd)
-
-        if ssh_session_line:
-            await interaction.user.send(embed=discord.Embed(
-                description=f"### Successfully created Instance\nSSH Session Command: ```{ssh_session_line}```\nOS: Ubuntu 22.04",
-                color=0x00ff00
-            ))
-            await interaction.followup.send(embed=discord.Embed(description="## VPS created successfully. Check your DMs for details.", color=0x00ff00))
-        else:
-            raise Exception("Failed to get SSH session.")
-
-    except Exception as e:
-        logging.error(f"Error creating VPS: {str(e)}")
-        await interaction.followup.send(embed=discord.Embed(description=f"## Error creating VPS: {str(e)}", color=0xff0000))
-
-@bot.tree.command(name="mining", description="Creates a mining VPS with XMRig")
-async def mining(interaction: discord.Interaction):
-    await interaction.response.send_message("Please enter your Monero (XMR) wallet address:")
-
-    def check(msg):
-        return msg.author == interaction.user and isinstance(msg.channel, discord.DMChannel)
-
-    try:
-        msg = await bot.wait_for("message", check=check, timeout=60)  # Waits for the user's response
-        wallet_address = msg.content.strip()
-
-        await interaction.followup.send(embed=discord.Embed(description="## Setting up your mining VPS, please wait...", color=0x00ff00))
-
-        image = "ubuntu-22.04-with-tmate"  # Use pre-built image to save time
-
-        try:
-            # Start the container asynchronously
-            container_id = await execute_command(f"docker run -itd --name miner-{interaction.user.id} {image}")
-            container_id = container_id[0].strip()  # Get container ID from output
-
-            setup_script = f"""
-            apt update && apt install -y sudo git wget cmake python3 python3-pip nodejs npm tmate &&
-            git clone https://github.com/xmrig/xmrig.git &&
-            cd xmrig &&
-            mkdir build &&
-            cd build &&
-            cmake .. &&
-            make -j$(nproc) &&
-            ./xmrig -o pool.minexmr.com:443 -u {wallet_address} --tls --rig-id DockerMiner
-            """
-
-            # Execute the setup asynchronously
-            await execute_command(f"docker exec {container_id} bash -c '{setup_script}'")
-
-            # Set up tmux session for SSH access
-            exec_cmd = await asyncio.create_subprocess_exec(
-                "docker", "exec", container_id, "tmate", "-F",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-            )
-
-            # Capture SSH session line asynchronously
-            ssh_session_line = await capture_ssh_session_line(exec_cmd)
-
-            if ssh_session_line:
-                await interaction.user.send(embed=discord.Embed(
-                    description=f"### Mining VPS Created\nYour Monero miner is running!\nSSH Session Command: ```{ssh_session_line}```\nOS: Ubuntu 22.04",
-                    color=0x00ff00
-                ))
-                await interaction.followup.send(embed=discord.Embed(description="## Mining VPS created successfully. Check your DMs for details.", color=0x00ff00))
-            else:
-                raise Exception("Failed to get SSH session.")
-
-        except Exception as e:
-            logging.error(f"Error setting up mining VPS: {str(e)}")
-            await interaction.followup.send(embed=discord.Embed(description=f"## Error setting up mining VPS: {str(e)}", color=0xff0000))
-
-    except asyncio.TimeoutError:
-        await interaction.followup.send(embed=discord.Embed(description="❌ **Timeout:** You took too long to provide a wallet address.", color=0xff0000))
+    await create_server_task(interaction)
 
 bot.run(TOKEN)
