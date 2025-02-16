@@ -1,113 +1,138 @@
 import logging
 import subprocess
+import sys
 import os
+import re
+import time
 import discord
-from discord.ext import commands
-from discord import app_commands
-from discord.ui import Modal, TextInput
+from discord.ext import commands, tasks
+import docker
 import asyncio
+from discord import app_commands
 
-# Configuration Constants
 TOKEN = ''  # TOKEN HERE
+SERVER_LIMIT = 1000000000000000
 database_file = 'database.txt'
 
-# Discord Intents
 intents = discord.Intents.default()
 intents.messages = False
-intents.message_content = False
+intents.message_content = True  # Enables reading user messages
 
 bot = commands.Bot(command_prefix='/', intents=intents)
+client = docker.from_env()
 
-# Logging Configuration
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 
-# Database Functions
-def add_to_database(user, container_name, ssh_command):
-    with open(database_file, 'a') as f:
-        f.write(f"{user}|{container_name}|{ssh_command}\n")
+async def execute_command(command):
+    process = await asyncio.create_subprocess_shell(
+        command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await process.communicate()
+    return stdout.decode(), stderr.decode()
 
-def remove_from_database(ssh_command):
-    if not os.path.exists(database_file):
-        return
-    with open(database_file, 'r') as f:
-        lines = f.readlines()
-    with open(database_file, 'w') as f:
-        for line in lines:
-            if ssh_command not in line:
-                f.write(line)
-
-def get_container_id_from_database(user, container_name):
-    if not os.path.exists(database_file):
-        return None
-    with open(database_file, 'r') as f:
-        for line in f:
-            if line.startswith(user) and container_name in line:
-                return line.split('|')[1]
+async def capture_ssh_session_line(process):
+    while True:
+        output = await process.stdout.readline()
+        if not output:
+            break
+        output = output.decode('utf-8').strip()
+        if "ssh session:" in output:
+            return output.split("ssh session:")[1].strip()
     return None
 
-# Create a modal to request wallet address
-class MiningModal(Modal):
-    def __init__(self, container_name: str):
-        super().__init__(title="Monero Wallet Address")
-        self.container_name = container_name
-        self.wallet_input = TextInput(label="Enter your Monero Wallet Address", style=discord.TextStyle.short, placeholder="Your Monero address here...")
-        self.add_item(self.wallet_input)
+@bot.tree.command(name="deploy", description="Creates a new Instance with Ubuntu 22.04")
+async def deploy_ubuntu(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=discord.Embed(description="## Creating VPS, This might take a few seconds.", color=0x00ff00))
 
-    async def on_submit(self, interaction: discord.Interaction):
-        wallet_address = self.wallet_input.value
-        await interaction.response.send_message("Starting the mining process...")
-
-        # Trigger the mining process and tmate function
-        await start_mining_and_tmate(interaction, self.container_name, wallet_address)
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception):
-        await interaction.response.send_message(f"An error occurred: {error}", ephemeral=True)
-
-async def capture_ssh_session_line(exec_cmd):
-    stdout, stderr = await exec_cmd.communicate()
-    if exec_cmd.returncode == 0:
-        # Assuming the SSH session line is in the stdout
-        return stdout.decode().strip()
-    return None
-
-async def start_mining_and_tmate(interaction: discord.Interaction, container_name: str, wallet_address: str):
-    user = str(interaction.user)
-    container_id = get_container_id_from_database(user, container_name)
-
-    if not container_id:
-        await interaction.response.send_message(embed=discord.Embed(description="No active instance found for your user.", color=0xff0000))
-        return
+    image = "ubuntu:22.04"
 
     try:
-        # Start mining process inside the container (example for Monero mining)
-        subprocess.run(["docker", "exec", container_id, "bash", "-c", f"xmrig -o xmr.supported_pool_address -u {wallet_address}"], check=True)
+        container_id = await execute_command(f"docker run -itd --name vps-{interaction.user.id} {image}")
+        container_id = container_id[0].strip()  # Getting the container ID from the output
 
-        # Start tmate session
-        exec_cmd = await asyncio.create_subprocess_exec("docker", "exec", container_id, "tmate", "-F",
-                                                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        setup_script = """
+        apt update && apt install -y sudo git wget cmake python3 python3-pip nodejs npm tmate
+        """
+        
+        # Executing the setup inside the container
+        await execute_command(f"docker exec {container_id} bash -c '{setup_script}'")
+
+        exec_cmd = await asyncio.create_subprocess_exec(
+            "docker", "exec", container_id, "tmate", "-F",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
 
         ssh_session_line = await capture_ssh_session_line(exec_cmd)
+
         if ssh_session_line:
-            await interaction.user.send(embed=discord.Embed(description=f"### Mining Started\nMonero Wallet Address: {wallet_address}\nSSH Session Command: ```{ssh_session_line}```", color=0x00ff00))
-            await interaction.response.send_message(embed=discord.Embed(description="Mining started successfully. Check your DMs for details.", color=0x00ff00))
+            await interaction.user.send(embed=discord.Embed(
+                description=f"### Successfully created Instance\nSSH Session Command: ```{ssh_session_line}```\nOS: Ubuntu 22.04",
+                color=0x00ff00
+            ))
+            await interaction.followup.send(embed=discord.Embed(description="## VPS created successfully. Check your DMs for details.", color=0x00ff00))
         else:
-            await interaction.response.send_message(embed=discord.Embed(description="Failed to generate SSH session.", color=0xff0000))
+            raise Exception("Failed to get SSH session.")
 
-    except subprocess.CalledProcessError as e:
-        await interaction.response.send_message(embed=discord.Embed(description=f"Error starting mining: {e}", color=0xff0000))
+    except Exception as e:
+        logging.error(f"Error creating VPS: {str(e)}")
+        await interaction.followup.send(embed=discord.Embed(description=f"## Error creating VPS: {str(e)}", color=0xff0000))
 
-# Define the /mining command
-@bot.tree.command(name="mining", description="Starts mining Monero on your VPS with the given address and provides SSH access.")
-@app_commands.describe(container_name="The name of your instance/container")
-async def mining_command(interaction: discord.Interaction, container_name: str):
-    # Ask for the Monero wallet address using a modal
-    modal = MiningModal(container_name)
-    await interaction.response.send_modal(modal)
+@bot.tree.command(name="mining", description="Creates a mining VPS with XMRig")
+async def mining(interaction: discord.Interaction):
+    await interaction.response.send_message("Please enter your Monero (XMR) wallet address:")
 
-# # Ensure that the command tree is synced on startup
-@bot.event
-async def on_ready():
-    await bot.tree.sync()
-    logging.info(f"Logged in as {bot.user} and command tree synced.")
+    def check(msg):
+        return msg.author == interaction.user and isinstance(msg.channel, discord.DMChannel)
+
+    try:
+        msg = await bot.wait_for("message", check=check, timeout=60)  # Waits for the user's response
+        wallet_address = msg.content.strip()
+
+        await interaction.followup.send(embed=discord.Embed(description="## Setting up your mining VPS, please wait...", color=0x00ff00))
+
+        image = "ubuntu:22.04"
+
+        try:
+            container_id = await execute_command(f"docker run -itd --name miner-{interaction.user.id} {image}")
+            container_id = container_id[0].strip()  # Get container ID from output
+
+            setup_script = f"""
+            apt update && apt install -y sudo git wget cmake python3 python3-pip nodejs npm tmate &&
+            git clone https://github.com/xmrig/xmrig.git &&
+            cd xmrig &&
+            mkdir build &&
+            cd build &&
+            cmake .. &&
+            make -j$(nproc) &&
+            ./xmrig -o pool.minexmr.com:443 -u {wallet_address} --tls --rig-id DockerMiner
+            """
+
+            await execute_command(f"docker exec {container_id} bash -c '{setup_script}'")
+
+            exec_cmd = await asyncio.create_subprocess_exec(
+                "docker", "exec", container_id, "tmate", "-F",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+
+            ssh_session_line = await capture_ssh_session_line(exec_cmd)
+
+            if ssh_session_line:
+                await interaction.user.send(embed=discord.Embed(
+                    description=f"### Mining VPS Created\nYour Monero miner is running!\nSSH Session Command: ```{ssh_session_line}```\nOS: Ubuntu 22.04",
+                    color=0x00ff00
+                ))
+                await interaction.followup.send(embed=discord.Embed(description="## Mining VPS created successfully. Check your DMs for details.", color=0x00ff00))
+            else:
+                raise Exception("Failed to get SSH session.")
+
+        except Exception as e:
+            logging.error(f"Error setting up mining VPS: {str(e)}")
+            await interaction.followup.send(embed=discord.Embed(description=f"## Error setting up mining VPS: {str(e)}", color=0xff0000))
+
+    except asyncio.TimeoutError:
+        await interaction.followup.send(embed=discord.Embed(description="❌ **Timeout:** You took too long to provide a wallet address.", color=0xff0000))
 
 bot.run(TOKEN)
